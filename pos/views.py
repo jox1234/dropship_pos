@@ -102,9 +102,15 @@ def save_product(request):
         category=oid(request.POST.get("category_id")); cat=db().categories.find_one({"_id":category,"workspace":workspace(request),"archived":{"$ne":True}})
         if not cat: raise ValueError("Choose an active category.")
         sub=request.POST.get("subcategory","").strip()
-        data={"owner":owner(request),"name":request.POST["name"].strip(),"sku":request.POST.get("sku",""),"supplier":request.POST.get("supplier",""),"cost":float(request.POST.get("cost",0)),"price":float(request.POST.get("price",0)),"stock":max(0,int(request.POST.get("stock",0))),"category_id":category,"category_name":cat["name"],"subcategory":sub,"updated":datetime.now(timezone.utc),"archived":False}
+        stock=max(0,int(request.POST.get("stock",0))); days=max(1,int(request.POST.get("deadline_days",30))); now=datetime.now(timezone.utc)
+        data={"owner":owner(request),"name":request.POST["name"].strip(),"sku":request.POST.get("sku",""),"supplier":request.POST.get("supplier",""),"cost":float(request.POST.get("cost",0)),"price":float(request.POST.get("price",0)),"stock":stock,"deadline_days":days,"category_id":category,"category_name":cat["name"],"subcategory":sub,"updated":now,"archived":False}
         pid=oid(request.POST.get("id"))
-        if pid: db().products.update_one({"_id":pid,"owner":owner(request)},{"$set":data})
+        existing=db().products.find_one({"_id":pid,"owner":owner(request)}) if pid else None
+        if existing and int(existing.get("stock",0))==stock:
+            data["initial_stock"]=int(existing.get("initial_stock",stock)); data["stock_since"]=existing.get("stock_since",now); data["deadline_at"]=existing.get("deadline_at",now+timedelta(days=days)); data["deadstock_status"]=existing.get("deadstock_status","active")
+        else:
+            data["initial_stock"]=stock; data["stock_since"]=now; data["deadline_at"]=now+timedelta(days=days); data["deadstock_status"]="active"
+        if existing: db().products.update_one({"_id":pid,"owner":owner(request)},{"$set":data})
         else: db().products.insert_one(data)
         return JsonResponse({"ok":True,"message":"Product saved"}) if request.headers.get("x-requested-with")=="XMLHttpRequest" else redirect("/products/")
     except Exception as e:
@@ -117,6 +123,47 @@ def delete_product(request,pid):
     return JsonResponse({"ok":True})
 @signed_in
 def sales(request): return render(request,"sales.html",{"products":products_for(request),"orders":orders_for(request),"tax":tax(request)})
+@signed_in
+def deadstock(request): return render(request,"deadstock.html",{})
+@signed_in
+def deadstock_data(request):
+    now=datetime.now(timezone.utc); rows=[]
+    for p in products_for(request,True):
+        initial=int(p.get("initial_stock",p.get("stock",0))); remaining=int(p.get("stock",0)); expired=int(p.get("expired_qty",0)); removed=int(p.get("removed_qty",0))
+        if initial<=0 and remaining<=0 and not p.get("deadstock_status"): continue
+        stock_since=p.get("stock_since",p.get("updated",now))
+        deadline=p.get("deadline_at") or (stock_since+timedelta(days=int(p.get("deadline_days",30))))
+        if deadline.tzinfo is None: deadline=deadline.replace(tzinfo=timezone.utc)
+        status=p.get("deadstock_status","active")
+        if status=="active" and remaining<=0: status="sold out"
+        elif status=="active" and now>=deadline: status="overdue"
+        sold=max(0,initial-remaining-expired-removed)
+        rows.append({"id":str(p["_id"]),"name":p.get("name","Unnamed item"),"category":p.get("category_name",""),"initial":initial,"sold":sold,"remaining":remaining,"capital":float(p.get("cost",0))*remaining,"deadline":deadline.isoformat(),"status":status,"reason":p.get("deadstock_reason","")})
+    return JsonResponse({"items":rows,"count":len(rows),"overdue":sum(1 for x in rows if x["status"]=="overdue"),"remaining":sum(x["remaining"] for x in rows),"capital":sum(x["capital"] for x in rows)})
+@signed_in
+@require_POST
+def deadstock_action(request,pid):
+    product=db().products.find_one({"_id":oid(pid),"owner":owner(request)})
+    if not product: return JsonResponse({"error":"Item not found"},status=404)
+    now=datetime.now(timezone.utc); stock=max(0,int(product.get("stock",0))); deadline=product.get("deadline_at",now)
+    if deadline.tzinfo is None: deadline=deadline.replace(tzinfo=timezone.utc)
+    if stock<=0 or product.get("deadstock_status") in ("expired","removed"):
+        return JsonResponse({"error":"This item has no remaining stock to process."},status=400)
+    action=request.POST.get("action"); reason=request.POST.get("reason","").strip()
+    if action=="extend":
+        try: days=int(request.POST.get("days",30))
+        except ValueError: days=0
+        if days<1 or days>3650: return JsonResponse({"error":"Choose an extension between 1 and 3650 days."},status=400)
+        changes={"deadline_days":days,"deadline_at":now+timedelta(days=days),"deadstock_status":"active","updated":now}
+    elif action=="expire":
+        if not reason: return JsonResponse({"error":"Add a reason before marking stock expired."},status=400)
+        changes={"expired_qty":stock,"stock":0,"deadstock_status":"expired","deadstock_reason":reason,"deadstock_action_at":now,"updated":now}
+    elif action=="remove":
+        changes={"removed_qty":stock,"stock":0,"deadstock_status":"removed","deadstock_reason":reason,"deadstock_action_at":now,"archived":True,"updated":now}
+    else: return JsonResponse({"error":"Choose extend, expire, or remove."},status=400)
+    db().products.update_one({"_id":product["_id"],"owner":owner(request)},{"$set":changes})
+    db().inventory_events.insert_one({"owner":owner(request),"product_id":product["_id"],"product_name":product.get("name"),"action":action,"quantity":stock,"reason":reason,"days":changes.get("deadline_days"),"created":now})
+    return JsonResponse({"ok":True,"message":"Deadline extended" if action=="extend" else ("Stock marked expired" if action=="expire" else "Stock removed and item archived")})
 @signed_in
 @require_POST
 def checkout(request):
@@ -200,7 +247,11 @@ def save_category(request):
 @admin_only
 @require_POST
 def set_threshold(request,cat_id):
-    try: value=float(request.POST.get("threshold",0))
+    raw=request.POST.get("threshold","").strip()
+    if not raw:
+        result=db().categories.update_one({"_id":oid(cat_id),"workspace":workspace(request)},{"$unset":{"threshold":""}})
+        return JsonResponse({"ok":bool(result.matched_count),"message":"Monthly margin target cleared"})
+    try: value=float(raw)
     except ValueError: return JsonResponse({"error":"Enter a valid percentage"},status=400)
     if not 0<=value<=100: return JsonResponse({"error":"Margin must be between 0 and 100"},status=400)
     result=db().categories.update_one({"_id":oid(cat_id),"workspace":workspace(request)},{"$set":{"threshold":value}})
@@ -208,6 +259,17 @@ def set_threshold(request,cat_id):
 @signed_in
 @admin_only
 def categories(request): return render(request,"categories.html",{"categories":cats_for(request,False)})
+@signed_in
+@admin_only
+@require_POST
+def delete_category(request,cat_id):
+    category=oid(cat_id)
+    if not category or not db().categories.find_one({"_id":category,"workspace":workspace(request)}):
+        return JsonResponse({"error":"Category not found"},status=404)
+    db().products.update_many({"category_id":category},{"$set":{"archived":True,"updated":datetime.now(timezone.utc)}})
+    db().categories.delete_one({"_id":category,"workspace":workspace(request)})
+    db().category_decisions.delete_many({"category_id":category})
+    return JsonResponse({"ok":True,"message":"Category deleted; related products archived and sales history retained"})
 @signed_in
 @admin_only
 @require_POST
@@ -226,7 +288,7 @@ def margin_alerts(request):
     month=datetime.now().strftime("%Y-%m"); start=datetime.now(timezone.utc).replace(day=1,hour=0,minute=0,second=0,microsecond=0)
     cats=cats_for(request); sales=orders_for(request,{"status":"completed","created":{"$gte":start}}); alerts=[]
     for c in cats:
-        threshold=float(c.get("threshold",0)); relevant=[o for o in sales if str(o.get("category_id"))==str(c["_id"])]
+        threshold=float(c.get("threshold") or 0); relevant=[o for o in sales if str(o.get("category_id"))==str(c["_id"])]
         revenue=sum(float(o.get("subtotal",0)) for o in relevant); profit=sum(float(o.get("profit",0)) for o in relevant); margin=(profit/revenue*100) if revenue else 0
         decided=db().category_decisions.find_one({"owner":owner(request),"category_id":c["_id"],"month":month})
         if threshold and margin<threshold and not decided: alerts.append({"id":str(c["_id"]),"name":c["name"],"margin":round(margin,1),"threshold":threshold,"month":month})
